@@ -1,0 +1,184 @@
+---
+title: "Data Cleaning Process"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(GGally)
+library(lubridate)
+```
+
+The code to scrape NBA Game data from Basketball Reference was adopted from https://www.r-bloggers.com/2018/12/scraping-nba-game-data-from-basketball-reference-com/. We modified the script to use it for the seasons from 2017 to 2022. The process involved changing the monthList for certain seasons, as 2020 and 2021 had unusual timelines
+
+```{r}
+##Parameters
+year <- "2017"
+monthList <- c("october", "november", "december", "january", "february", 
+               "march", "april", "may", "june")
+
+# We modified months depending on season; had to manually check the website
+playoff_startDate <- ymd("2017-04-13")
+## Modified Playoff Start date depending on season
+
+outputfile <- "NBA-2017_game_data.csv"
+```
+
+```{r}
+df <- data.frame()
+for (month in monthList) {
+    # get webpage
+    url <- paste0("https://www.basketball-reference.com/leagues/NBA_", year, 
+                  "_games-", month, ".html")
+    webpage <- read_html(url)
+    
+    # get column names
+    col_names <- webpage %>% 
+        html_nodes("table#schedule > thead > tr > th") %>% 
+        html_attr("data-stat")    
+    col_names <- c("game_id", col_names)
+    
+    # extract dates column
+    # note that in april, there is a break in the table which just says 
+    # "Playoffs". this messes with the data merging later, so we get rid of it
+    dates <- webpage %>% 
+        html_nodes("table#schedule > tbody > tr > th") %>% 
+        html_text()
+    dates <- dates[dates != "Playoffs"]
+    
+    # extract game id
+    # we need to remove the NA that is due to the "Playoffs" row in april
+    game_id <- webpage %>% 
+        html_nodes("table#schedule > tbody > tr > th") %>%
+        html_attr("csk")
+    game_id <- game_id[!is.na(game_id)]
+    
+    # extract all columns (except date)
+    data <- webpage %>% 
+        html_nodes("table#schedule > tbody > tr > td") %>% 
+        html_text() %>%
+        matrix(ncol = length(col_names) - 2, byrow = TRUE)
+    
+    # combine game IDs, dates and columns in dataframe for this month, add col names
+    month_df <- as.data.frame(cbind(game_id, dates, data), stringsAsFactors = FALSE)
+    names(month_df) <- col_names
+    
+    # add to overall dataframe
+    df <- rbind(df, month_df)
+}
+
+# change columns to the correct types
+df$visitor_pts <- as.numeric(df$visitor_pts)
+df$home_pts    <- as.numeric(df$home_pts)
+df$attendance  <- as.numeric(gsub(",", "", df$attendance))
+df$date_game   <- mdy(df$date_game)
+
+# add column to indicate if regular season or playoff
+df$game_type <- with(df, ifelse(date_game >= playoff_startDate, 
+                                "Playoff", "Regular"))
+
+
+df$box_score_text <- NULL
+df$game_remarks <- NULL
+```
+
+```{r}
+write.csv(df,outputfile, row.names = FALSE)
+```
+
+
+```{r}
+# read in data
+d = read.csv('data_2019-2022.csv')
+
+# convert date_game column from strings into Date objects and remove X and game_id
+d = d %>% 
+  mutate(date_game = as.Date(date_game, format = "%Y-%m-%d")) %>%
+  mutate(X = NULL, game_id = NULL)
+
+# change column names & add another variable for home or away
+d = d %>% 
+  rename(team_name = home_team_name) %>%
+  rename(team_pts = home_pts) %>%
+  rename(opponent_name = visitor_team_name) %>%
+  rename(opponent_pts = visitor_pts) %>%
+  mutate(away0_home1 = 1)
+
+# add another row for each game and sort by date
+d = d %>%
+  mutate(game_id = 1:nrow(d))
+
+for(x in 1:nrow(d)) {
+  d = d %>%
+    add_row(date_game = d$date_game[x], 
+            game_id = x,
+            game_start_time = d$game_start_time[x],
+            opponent_name = d$team_name[x],
+            opponent_pts = d$team_pts[x],
+            team_name = d$opponent_name[x],
+            team_pts = d$opponent_pts[x],
+            overtimes = d$overtimes[x],
+            attendance = d$attendance[x],
+            game_type = d$game_type[x],
+            away0_home1 = 0)
+}
+d = d %>% arrange(date_game)
+
+# change away0_home1 to 0.5 for the bubble games
+d = d %>% 
+  mutate(away0_home1 = ifelse(attendance == 0 | is.na(attendance), .5, away0_home1))
+
+# calculate attendence percentage 
+d = d %>% 
+  mutate(attendance = ifelse(attendance==0, NA, attendance)) %>% 
+  group_by(team_name) %>% 
+  mutate(attendance.perc = away0_home1*(attendance/max(attendance, na.rm = TRUE)))
+
+head(d)
+```
+
+```{r}
+# add new empty column rest_time based off time since last game
+d = d %>% 
+  mutate(rest_time = 0)
+
+d1 = data.frame(matrix(nrow = 0, ncol = length(colnames(d)) ))
+colnames(d1) = colnames(d)
+                
+
+# loop through each team and fill in rest_time
+teams = unique(d$team_name)
+for(team in teams) {
+  teamGames = d %>% filter(team_name == team)
+  
+  difference = diff(as.matrix(teamGames$date_game))
+  rest = ifelse(difference>10, 10, difference)
+  
+  teamGames$rest_time = c(NA,rest)
+  
+  d1 = rbind(d1, teamGames)
+}
+```
+
+
+```{r}
+# find rest differential for each game 
+d1 = d1 %>% 
+  arrange(game_id) %>%
+  mutate(rest_diff = NA)
+head(d1)
+
+for(x in 1:(nrow(d1)/2)) {
+  game1 = 2*x - 1
+  game2 = 2*x
+  rd1 = d1$rest_time[game1] - d1$rest_time[game2]
+  rd2 = -1 * rd1
+  d1$rest_diff[game1] = rd1
+  d1$rest_diff[game2] = rd2
+}
+```
+```{r}
+write.csv(d1,"4.27.2022_cleaned_data.csv")
+```
+
